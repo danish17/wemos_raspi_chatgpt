@@ -4,12 +4,13 @@ import sounddevice as sd
 import queue
 import json
 import time
-import numpy
+import numpy as np
 import serial
 from vosk import Model, KaldiRecognizer
-from gtts import gTTS
-from pydub import AudioSegment
-from pydub.playback import play
+import pygame
+import asyncio
+import edge_tts
+import threading
 
 # Suppress warnings and errors
 class suppress_stderr:
@@ -21,9 +22,13 @@ class suppress_stderr:
         sys.stderr.close()
         sys.stderr = self.old_stderr
 
-# Initialize the recognizer with Vosk model
-model = Model("model")
-recognizer = KaldiRecognizer(model, 16000)
+# Initialize two recognizers: one for wake word, one for queries
+wake_word_model = Model("vosk-model-small-en-us-0.15")
+wake_word_recognizer = KaldiRecognizer(wake_word_model, 16000)
+wake_word_recognizer.SetWords(True)
+
+query_model = Model("vosk-model-small-en-us-0.15")
+query_recognizer = KaldiRecognizer(query_model, 16000)
 
 q = queue.Queue()
 
@@ -35,45 +40,68 @@ except Exception as e:
     print(f"Error opening serial port: {e}")
     sys.exit()
 
+# Initialize pygame mixer
+pygame.mixer.init()
+
+# Global flag for interruption
+interrupt_flag = threading.Event()
+
+def play_beep():
+    pygame.mixer.music.load("beep.mp3")
+    pygame.mixer.music.play()
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
+
 def callback(indata, frames, time, status):
     if status:
         print(status, file=sys.stderr)
     q.put(bytes(indata))
+
+def detect_wake_word(data):
+    if wake_word_recognizer.AcceptWaveform(data):
+        result = json.loads(wake_word_recognizer.Result())
+        if "hello pixie" in result.get("text", "").lower():
+            return True
+    return False
 
 def record_query():
     print("Listening for your query...")
     silence_start = None
     query_text = ""
     last_speech_time = time.time()
-    max_silence_duration = 1  # Maximum silence duration in seconds
-    min_query_duration = 1  # Minimum query duration in seconds
-    energy_threshold = 100  # Adjust this value based on your microphone and environment
+    max_silence_duration = 1
+    min_query_duration = 1
+    energy_threshold = 100
 
     while True:
         data = q.get()
-        if recognizer.AcceptWaveform(data):
-            result = recognizer.Result()
-            text = json.loads(result)["text"]
+        
+        # Check for wake word (interrupt)
+        if detect_wake_word(data):
+            print("Interrupt detected!")
+            return "INTERRUPT"
+
+        if query_recognizer.AcceptWaveform(data):
+            result = json.loads(query_recognizer.Result())
+            text = result.get("text", "")
             if text:
                 print(f"Query recorded: {text}")
                 query_text += text + " "
                 last_speech_time = time.time()
                 silence_start = None
         else:
-            partial_result = recognizer.PartialResult()
-            partial_text = json.loads(partial_result)["partial"]
+            partial_result = json.loads(query_recognizer.PartialResult())
+            partial_text = partial_result.get("partial", "")
             if partial_text:
                 print(f"Partial: {partial_text}", end='\r')
 
-        # Check for speech energy
-        energy = numpy.frombuffer(data, dtype=numpy.int16).max()
+        energy = np.frombuffer(data, dtype=np.int16).max()
         if energy > energy_threshold:
             last_speech_time = time.time()
             silence_start = None
         elif silence_start is None:
             silence_start = time.time()
 
-        # Check for end conditions
         current_time = time.time()
         query_duration = current_time - last_speech_time
         silence_duration = current_time - silence_start if silence_start else 0
@@ -82,7 +110,7 @@ def record_query():
             if silence_duration >= max_silence_duration:
                 print(f"\nSilence detected for {silence_duration:.1f} seconds, stopping recording.")
                 break
-            elif current_time - last_speech_time > 10:  # Maximum total duration
+            elif current_time - last_speech_time > 10:
                 print("\nMaximum recording duration reached, stopping recording.")
                 break
 
@@ -92,20 +120,10 @@ def listen():
     print("Listening for the wake word...")
     while True:
         data = q.get()
-        if recognizer.AcceptWaveform(data):
-            result = recognizer.Result()
-            text = json.loads(result)["text"]
-            if text:
-                print(text.lower())
-            if "hello pixie" in text.lower():
-                print("Wake word detected!")
-                return True
-        else:
-            partial_result = recognizer.PartialResult()
-            partial_text = json.loads(partial_result)["partial"]
-            if "hello pixie" in partial_text.lower():
-                print("Partial wake word detected!")
-                return True
+        if detect_wake_word(data):
+            print("Wake word detected!")
+            play_beep()
+            return True
 
 def clear_queue(q):
     while not q.empty():
@@ -130,12 +148,34 @@ def read_from_wemos():
         print(f"Error reading from Wemos: {e}")
         return None
 
-def speak_text(text):
-    tts = gTTS(text=text, lang='en')
-    tts.save("response.mp3")
-    sound = AudioSegment.from_mp3("response.mp3")
-    play(sound)
+async def speak_text(text):
+    communicate = edge_tts.Communicate(text, "en-US-AriaNeural")
+    await communicate.save("response.mp3")
+    
+    pygame.mixer.init()
+    pygame.mixer.music.load("response.mp3")
+    pygame.mixer.music.play()
+    
+    while pygame.mixer.music.get_busy():
+        pygame.time.Clock().tick(10)
+        if interrupt_flag.is_set():
+            pygame.mixer.music.stop()
+            break
+    
     os.remove("response.mp3")
+
+def check_for_wake_word():
+    global interrupt_flag
+    while pygame.mixer.music.get_busy() and not interrupt_flag.is_set():
+        try:
+            data = q.get(timeout=0.1)
+            if detect_wake_word(data):
+                print("Wake word detected during playback!")
+                interrupt_flag.set()
+                return True
+        except queue.Empty:
+            pass
+    return False
 
 if __name__ == "__main__":
     with suppress_stderr():
@@ -144,24 +184,42 @@ if __name__ == "__main__":
                 while True:
                     if listen():
                         clear_queue(q)
-                        recognizer.Reset()
+                        wake_word_recognizer.Reset()
+                        query_recognizer.Reset()
                         query = record_query()
+                        if query == "INTERRUPT":
+                            print("Interrupted. Listening for new wake word.")
+                            continue
                         if query:
                             print(f"Processing query: {query}")
                             try:
                                 ser.write((query + '\n').encode('utf-8'))
                                 print("Query sent to Wemos")
                                 
-                                # Wait for and read the response from Wemos
                                 print("Waiting for response from Wemos...")
                                 response = read_from_wemos()
                                 if response:
                                     print(f"Received response: {response}")
-                                    speak_text(response)
+                                    
+                                    # Reset the interrupt flag
+                                    interrupt_flag.clear()
+                                    
+                                    # Start a thread to check for wake word during playback
+                                    wake_word_thread = threading.Thread(target=check_for_wake_word)
+                                    wake_word_thread.start()
+                                    
+                                    # Play the response
+                                    asyncio.run(speak_text(response))
+                                    
+                                    # Wait for the wake word thread to finish
+                                    wake_word_thread.join()
+                                    
+                                    if interrupt_flag.is_set():
+                                        print("Playback interrupted. Listening for new query.")
+                                        continue
                             except Exception as e:
                                 print(f"Error communicating with Wemos: {e}")
         except KeyboardInterrupt:
             print("\nDone")
         except Exception as e:
             print(f"Error: {e}")
-
